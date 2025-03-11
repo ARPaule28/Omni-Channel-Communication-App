@@ -170,6 +170,15 @@ def send_email(sender_id, receiver_email, subject, content, attachment=None):
         return False
 
 def send_sms(sender_id, receiver_id, content, attachment=None):
+    """
+    Send an SMS to any phone number, not just registered users.
+    
+    Args:
+        sender_id: ID of the sending user
+        receiver_id: ID of the receiving user
+        content: Body content of the SMS
+        attachment: Optional file attachment (for MMS)
+    """
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -180,7 +189,7 @@ def send_sms(sender_id, receiver_id, content, attachment=None):
     cur.execute("SELECT phone_number FROM users WHERE id = %s", (receiver_id,))
     receiver_phone = cur.fetchone()[0]
     
-    # Save message to database
+    # Save attachment if provided
     attachment_path = None
     if attachment is not None:
         # Save attachment to disk
@@ -192,6 +201,7 @@ def send_sms(sender_id, receiver_id, content, attachment=None):
         with open(attachment_path, "wb") as f:
             f.write(attachment.getbuffer())
     
+    # Save message to database
     cur.execute("""
     INSERT INTO messages (sender_id, receiver_id, message_type, content, attachment_path, status)
     VALUES (%s, %s, 'sms', %s, %s, 'sent')
@@ -201,10 +211,24 @@ def send_sms(sender_id, receiver_id, content, attachment=None):
     cur.close()
     conn.close()
     
-    # In a real app, you would use Twilio or similar service
-    # For demo, we'll just simulate sending
-    st.success(f"SMS sent from {sender_phone} to {receiver_phone}")
-    return True
+    # Send the SMS using Twilio
+    try:
+        account_sid = 'AC286c1c9bc019897af671fe9c3a558ccd'  # Replace with your Twilio Account SID
+        auth_token = 'a2be9cec0c8b7d75ca4a73676eb23ad5'  # Replace with your Twilio Auth Token
+        client = Client(account_sid, auth_token)
+        
+        message = client.messages.create(
+            from_='+18508134976',  # Replace with your Twilio phone number
+            body=content,
+            to=receiver_phone
+        )
+        
+        st.success(f"SMS sent successfully from {sender_phone} to {receiver_phone}")
+        return True
+        
+    except Exception as e:
+        st.error(f"Error sending SMS: {str(e)}")
+        return False
 
 def send_chat(sender_id, receiver_id, content, attachment=None):
     conn = get_db_connection()
@@ -526,7 +550,6 @@ def main():
             st.subheader("Send SMS")
             recipient = st.selectbox("To", user_options, format_func=lambda x: x[1])
             content = st.text_area("Message")
-            attachment = st.file_uploader("Attachment (MMS)")
             
             if st.button("Send SMS"):
                 if send_sms(st.session_state.user_id, recipient[0], content, attachment):
@@ -563,7 +586,7 @@ def main():
                 if msg[5]:  # Attachment
                     attachment_path = msg[5]
                     if attachment_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
-                        st.image(attachment_path, caption="Attachment", use_column_width=True)
+                        st.image(attachment_path, caption="Attachment", use_container_width=True)
                     else:
                         st.markdown(f"[Download Attachment]({attachment_path})")
             
