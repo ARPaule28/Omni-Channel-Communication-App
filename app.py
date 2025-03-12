@@ -735,6 +735,9 @@ def main():
         elif option == "Chat":
             st.header("Chat")
             
+            # Add recipient selection at the top
+            recipient = st.selectbox("Select user to chat with", user_options, format_func=lambda x: x[1])
+            
             # Display chat history
             chat_messages = get_messages(st.session_state.user_id, "chat")
             filtered_messages = [msg for msg in chat_messages if 
