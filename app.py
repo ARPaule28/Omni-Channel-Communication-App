@@ -15,6 +15,21 @@ import imaplib
 import email
 from email.header import decode_header
 from O365 import Account, FileSystemTokenBackend, Message
+from twilio.twiml.voice_response import VoiceResponse
+from flask import Flask, request
+from threading import Thread
+from dotenv import load_dotenv
+
+load_dotenv()  # Add this near the top of your file, after imports
+
+# Initialize Flask app
+flask_app = Flask(__name__)
+
+# Twilio credentials
+account_sid = os.getenv('TWILIO_ACCOUNT_SID')
+auth_token = os.getenv('TWILIO_AUTH_TOKEN')
+twilio_number = os.getenv('TWILIO_PHONE_NUMBER')
+client = Client(account_sid, auth_token)
 
 # Database connection
 def get_db_connection():
@@ -22,7 +37,7 @@ def get_db_connection():
         host="localhost",
         database="omni_channel_db",
         user="postgres",
-        password="password"  # Replace with actual password or use environment variables
+        password=os.getenv('DB_PASSWORD')
     )
     return conn
 
@@ -62,11 +77,12 @@ def init_db():
     CREATE TABLE IF NOT EXISTS calls (
         id SERIAL PRIMARY KEY,
         caller_id INTEGER REFERENCES users(id),
-        receiver_id INTEGER REFERENCES users(id),
+        receiver_phone VARCHAR(20),
         start_time TIMESTAMP,
         end_time TIMESTAMP,
         status VARCHAR(20),  -- 'ongoing', 'completed', 'missed'
         direction VARCHAR(10),  -- 'inbound', 'outbound'
+        call_sid VARCHAR(34),  -- Twilio Call SID
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
@@ -84,6 +100,55 @@ def init_db():
     conn.commit()
     cur.close()
     conn.close()
+
+# Add a route for the root URL
+@flask_app.route('/')
+def index():
+    return "Welcome to the Omni-Channel Communication App!"
+
+# Add a route for the favicon
+@flask_app.route('/favicon.ico')
+def favicon():
+    return '', 204
+
+# Function to handle incoming calls
+@flask_app.route("/incoming-call", methods=["POST"])
+def incoming_call():
+    # Get call details from Twilio
+    from_number = request.form.get('From', '')
+    print(f"Incoming call from: {from_number}")
+    
+    # Look up the caller in the database
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, username FROM users WHERE phone_number = %s", (from_number,))
+    caller = cur.fetchone()
+    
+    # Find user2 to receive the call
+    cur.execute("SELECT phone_number FROM users WHERE username = 'user2'")
+    receiver = cur.fetchone()
+    receiver_phone = receiver[0] if receiver else None
+    
+    # Record the call in database
+    if caller and receiver_phone:
+        cur.execute("""
+        INSERT INTO calls (caller_id, receiver_phone, start_time, status, direction)
+        VALUES (%s, %s, NOW(), 'ongoing', 'inbound')
+        RETURNING id
+        """, (caller[0], receiver_phone))
+        call_id = cur.fetchone()[0]
+        conn.commit()
+        print(f"Call recorded with ID: {call_id}")
+    
+    cur.close()
+    conn.close()
+    
+    # Create TwiML response to forward the call to user2's phone number
+    response = VoiceResponse()
+    response.say("Hello, this is a call from the Omni-Channel Communication App.")
+    response.dial(receiver_phone)
+    
+    return str(response)
 
 # Functions for handling each communication channel
 def send_email(sender_id, receiver_email, subject, content, attachment=None):
@@ -137,8 +202,8 @@ def send_email(sender_id, receiver_email, subject, content, attachment=None):
     try:
         smtp_server = "smtp.gmail.com"
         smtp_port = 587
-        smtp_username = "angelrobertpaule28@gmail.com"  # Your Gmail address
-        smtp_password = "gotk xcao hgoa wysq"  # Your app password or Gmail password
+        smtp_username = os.getenv('GMAIL_USERNAME')
+        smtp_password = os.getenv('GMAIL_APP_PASSWORD')
         
         # Create message
         msg = MIMEMultipart()
@@ -220,7 +285,7 @@ def send_sms(sender_id, receiver_id, content, attachment=None):
         message = client.messages.create(
             from_='+18508134976',  # Replace with your Twilio phone number
             body=content,
-            to=receiver_phone
+            to='+18777804236'
         )
         
         st.success(f"SMS sent successfully from {sender_phone} to {receiver_phone}")
@@ -265,50 +330,80 @@ def send_chat(sender_id, receiver_id, content, attachment=None):
     st.success("Chat message sent")
     return True
 
-def make_call(caller_id, receiver_id, direction):
+def make_call(caller_id, receiver_phone, direction):
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Get caller and receiver details
+    # Get caller details
     cur.execute("SELECT phone_number FROM users WHERE id = %s", (caller_id,))
     caller_phone = cur.fetchone()[0]
     
-    cur.execute("SELECT phone_number FROM users WHERE id = %s", (receiver_id,))
-    receiver_phone = cur.fetchone()[0]
-    
-    # Record call in database
-    cur.execute("""
-    INSERT INTO calls (caller_id, receiver_id, start_time, status, direction)
-    VALUES (%s, %s, %s, 'ongoing', %s)
-    """, (caller_id, receiver_id, datetime.now(), direction))
-    
-    call_id = cur.fetchone()[0]
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    # In a real app, you would use Twilio or similar service
-    # For demo, we'll just simulate calling
-    st.success(f"Call initiated from {caller_phone} to {receiver_phone}")
-    return call_id
+    # Make the call using Twilio
+    try:
+        account_sid = 'AC286c1c9bc019897af671fe9c3a558ccd'  # Replace with your Twilio Account SID
+        auth_token = 'a2be9cec0c8b7d75ca4a73676eb23ad5'  # Replace with your Twilio Auth Token
+        client = Client(account_sid, auth_token)
+        
+        call = client.calls.create(
+            url='https://4824-64-224-134-197.ngrok-free.app/incoming-call',  # Replace with your ngrok URL
+            to=receiver_phone,
+            from_='+18508134976'  # Replace with your Twilio phone number
+        )
+        
+        call_sid = call.sid
+        
+        # Record call in database
+        cur.execute("""
+        INSERT INTO calls (caller_id, receiver_phone, start_time, status, direction, call_sid)
+        VALUES (%s, %s, %s, 'ongoing', %s, %s)
+        RETURNING id
+        """, (caller_id, receiver_phone, datetime.now(), direction, call_sid))
+        
+        call_id = cur.fetchone()[0]
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        st.success(f"Call initiated from {caller_phone} to {receiver_phone}")
+        return call_id
+        
+    except Exception as e:
+        st.error(f"Error making call: {str(e)}")
+        return None
 
 def end_call(call_id):
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Update call record
-    cur.execute("""
-    UPDATE calls SET end_time = %s, status = 'completed'
-    WHERE id = %s
-    """, (datetime.now(), call_id))
+    # Get the call SID from the database
+    cur.execute("SELECT call_sid FROM calls WHERE id = %s", (call_id,))
+    call_sid = cur.fetchone()[0]
     
-    conn.commit()
-    cur.close()
-    conn.close()
-    
-    st.success("Call ended")
-    return True
+    # End the call using Twilio
+    try:
+        account_sid = 'AC286c1c9bc019897af671fe9c3a558ccd'  # Replace with your Twilio Account SID
+        auth_token = 'a2be9cec0c8b7d75ca4a73676eb23ad5'  # Replace with your Twilio Auth Token
+        client = Client(account_sid, auth_token)
+        
+        call = client.calls(call_sid).update(status='completed')
+        
+        # Update call record in database
+        cur.execute("""
+        UPDATE calls SET end_time = %s, status = 'completed'
+        WHERE id = %s
+        """, (datetime.now(), call_id))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        st.success("Call ended")
+        return True
+        
+    except Exception as e:
+        st.error(f"Error ending call: {str(e)}")
+        return False
 
 def get_messages(user_id, message_type=None):
     conn = get_db_connection()
@@ -345,22 +440,20 @@ def get_calls(user_id, direction=None):
     
     if direction:
         cur.execute("""
-        SELECT c.id, caller.username, receiver.username, c.start_time, c.end_time, c.status, c.direction
+        SELECT c.id, caller.username, c.receiver_phone, c.start_time, c.end_time, c.status, c.direction
         FROM calls c
         JOIN users caller ON c.caller_id = caller.id
-        JOIN users receiver ON c.receiver_id = receiver.id
-        WHERE (c.caller_id = %s OR c.receiver_id = %s) AND c.direction = %s
+        WHERE c.caller_id = %s AND c.direction = %s
         ORDER BY c.created_at DESC
-        """, (user_id, user_id, direction))
+        """, (user_id, direction))
     else:
         cur.execute("""
-        SELECT c.id, caller.username, receiver.username, c.start_time, c.end_time, c.status, c.direction
+        SELECT c.id, caller.username, c.receiver_phone, c.start_time, c.end_time, c.status, c.direction
         FROM calls c
         JOIN users caller ON c.caller_id = caller.id
-        JOIN users receiver ON c.receiver_id = receiver.id
-        WHERE c.caller_id = %s OR c.receiver_id = %s
+        WHERE c.caller_id = %s
         ORDER BY c.created_at DESC
-        """, (user_id, user_id))
+        """, (user_id,))
     
     calls = cur.fetchall()
     cur.close()
@@ -382,8 +475,8 @@ def get_users():
 
 # Function to fetch emails from an external email account
 def fetch_emails(limit=5):
-    email_user = "angelrobertpaule28@gmail.com"  # Replace with your Gmail address
-    email_password = "gotk xcao hgoa wysq"  # Replace with your app password
+    email_user = os.getenv('GMAIL_USERNAME')
+    email_password = os.getenv('GMAIL_APP_PASSWORD')
     imap_server = "imap.gmail.com"
     imap_port = 993
     
@@ -424,30 +517,38 @@ def fetch_emails(limit=5):
                 # Decode the email sender
                 from_ = msg.get("From")
                 
-                # Get the email body
+                # Get the email body and attachments
                 body = ""
+                attachments = []
                 if msg.is_multipart():
                     for part in msg.walk():
                         content_type = part.get_content_type()
                         content_disposition = str(part.get("Content-Disposition"))
                         
-                        if "attachment" not in content_disposition:
-                            if content_type == "text/plain":
-                                try:
-                                    body = part.get_payload(decode=True).decode()
-                                except UnicodeDecodeError:
-                                    body = part.get_payload(decode=True).decode('latin1')
+                        if "attachment" in content_disposition:
+                            # Extract attachment
+                            filename = part.get_filename()
+                            if filename:
+                                attachments.append(filename)
+                                filepath = os.path.join("attachments", filename)
+                                os.makedirs("attachments", exist_ok=True)
+                                with open(filepath, "wb") as f:
+                                    f.write(part.get_payload(decode=True))
+                        elif content_type == "text/plain" and "attachment" not in content_disposition:
+                            # Extract plain text email body
+                            body = part.get_payload(decode=True).decode()
+                        elif content_type == "text/html" and "attachment" not in content_disposition:
+                            # Extract HTML email body
+                            body = part.get_payload(decode=True).decode()
                 else:
-                    try:
-                        body = msg.get_payload(decode=True).decode()
-                    except UnicodeDecodeError:
-                        body = msg.get_payload(decode=True).decode('latin1')
+                    body = msg.get_payload(decode=True).decode()
                 
                 emails.append({
                     "from": from_,
                     "subject": subject,
                     "body": body,
-                    "attachments": []
+                    "is_html": content_type == "text/html",
+                    "attachments": attachments
                 })
     
     # Close the connection and logout
@@ -455,6 +556,46 @@ def fetch_emails(limit=5):
     mail.logout()
     
     return emails
+
+def get_incoming_calls():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("""
+    SELECT c.id, caller.username, c.receiver_phone, c.start_time, c.status, c.direction
+    FROM calls c
+    JOIN users caller ON c.caller_id = caller.id
+    WHERE c.direction = 'inbound' AND c.status = 'ongoing'
+    ORDER BY c.start_time DESC
+    """)
+    
+    calls = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    return calls
+
+# Function to check for incoming calls
+def check_incoming_calls(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Check for ongoing inbound calls where this user is the receiver
+    cur.execute("""
+    SELECT c.id, u.username, u.phone_number
+    FROM calls c
+    JOIN users u ON c.caller_id = u.id
+    WHERE c.receiver_id = %s AND c.status = 'ongoing' AND c.direction = 'inbound'
+    AND c.end_time IS NULL
+    ORDER BY c.start_time DESC
+    LIMIT 1
+    """, (user_id,))
+    
+    incoming_call = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    return incoming_call
 
 # Main Streamlit app
 def main():
@@ -521,9 +662,9 @@ def main():
         if option == "Email":
             st.header("Email")
             
-            # Compose email section
-            st.subheader("Send Email")
-            recipient_email = st.text_input("To")  # Text input for recipient email address
+            # Compose Email section
+            st.subheader("Compose Email")
+            recipient_email = st.text_input("To")
             subject = st.text_input("Subject")
             content = st.text_area("Message")
             attachment = st.file_uploader("Attachment")
@@ -532,16 +673,41 @@ def main():
                 if send_email(st.session_state.user_id, recipient_email, subject, content, attachment):
                     st.success("Email sent successfully!")
             
-            # Fetch and display emails from external account
+            # Add a separator between compose and inbox
+            st.markdown("---")
+            
+            # Inbox section
             st.subheader("Inbox")
-            emails = fetch_emails(limit=5)  # Limit to the latest 5 emails
+            emails = fetch_emails(limit=2)
             
             for email in emails:
-                with st.expander(f"From: {email['from']} - Subject: {email['subject']}"):
-                    st.write(email['body'])
+                with st.container():
+                    st.markdown("""
+                    ---
+                    **From:** {}  
+                    **Subject:** {}
+                    """.format(email['from'], email['subject']))
                     
-                    for attachment in email['attachments']:
-                        st.write(f"Attachment: {attachment}")
+                    with st.expander("View Message"):
+                        # Display the content without HTML tags
+                        from bs4 import BeautifulSoup
+                        
+                        if email['is_html']:
+                            soup = BeautifulSoup(email['body'], 'html.parser')
+                            clean_text = soup.get_text(separator='\n')
+                            st.write(clean_text)
+                        else:
+                            st.write(email['body'])
+                        
+                        if email['attachments']:
+                            st.markdown("**Attachments:**")
+                            for attachment in email['attachments']:
+                                st.download_button(
+                                    label=f"📎 {attachment}",
+                                    data=open(os.path.join("attachments", attachment), "rb"),
+                                    file_name=attachment
+                                )
+                    st.markdown("---")
         
         elif option == "SMS":
             st.header("SMS")
@@ -552,7 +718,7 @@ def main():
             content = st.text_area("Message")
             
             if st.button("Send SMS"):
-                if send_sms(st.session_state.user_id, recipient[0], content, attachment):
+                if send_sms(st.session_state.user_id, recipient[0], content):
                     st.success("SMS sent successfully!")
             
             # Show SMS history
@@ -568,9 +734,6 @@ def main():
         
         elif option == "Chat":
             st.header("Chat")
-            
-            recipient = st.selectbox("Chat with", user_options, format_func=lambda x: x[1])
-            st.subheader(f"Chat with {recipient[1]}")
             
             # Display chat history
             chat_messages = get_messages(st.session_state.user_id, "chat")
@@ -603,19 +766,46 @@ def main():
             
             # Make call section
             st.subheader("Make a Call")
-            recipient = st.selectbox("Call", user_options, format_func=lambda x: x[1])
+            receiver_phone = st.text_input("Enter phone number to call")
             
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("Make Outbound Call"):
-                    call_id = make_call(st.session_state.user_id, recipient[0], "outbound")
+                    call_id = make_call(st.session_state.user_id, receiver_phone, "outbound")
                     st.session_state.current_call = call_id
-                    st.success(f"Calling {recipient[1]}...")
+                    st.success(f"Calling {receiver_phone}...")
             
             with col2:
                 if st.button("End Call") and 'current_call' in st.session_state:
                     end_call(st.session_state.current_call)
                     st.session_state.pop('current_call')
+            
+            # Display incoming calls
+            st.subheader("Incoming Calls")
+            incoming_call = check_incoming_calls(st.session_state.user_id)
+            if incoming_call:
+                call_id, caller_name, caller_phone = incoming_call
+                st.warning(f"Incoming call from {caller_name} ({caller_phone})")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("Answer Call"):
+                        # In a real app, you would connect the call
+                        st.success(f"Connected to call with {caller_name}")
+                
+                with col2:
+                    if st.button("Decline Call"):
+                        # Update call status
+                        conn = get_db_connection()
+                        cur = conn.cursor()
+                        cur.execute("""
+                        UPDATE calls SET status = 'missed', end_time = NOW()
+                        WHERE id = %s
+                        """, (call_id,))
+                        conn.commit()
+                        cur.close()
+                        conn.close()
+                        st.rerun()
             
             # Call history
             st.subheader("Call History")
@@ -629,7 +819,7 @@ def main():
                 if call[3] and call[4]:  # start_time and end_time
                     duration = str(call[4] - call[3])
                 
-                st.write(f"{direction} call with {call[2] if direction == 'Outgoing' else call[1]}")
+                st.write(f"{direction} call with {call[2]}")
                 st.write(f"Status: {status}, Duration: {duration}")
                 st.write("---")
         
@@ -675,4 +865,12 @@ def main():
                         st.write("Has attachment")
 
 if __name__ == "__main__":
+    # Run Flask app in a separate thread
+    def run_flask():
+        flask_app.run(port=5000)
+    
+    flask_thread = Thread(target=run_flask)
+    flask_thread.start()
+    
+    # Run Streamlit app
     main()
